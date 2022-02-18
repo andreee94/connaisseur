@@ -3,6 +3,7 @@ import pytest
 import time
 
 import connaisseur.logging_wrapper as lw
+from . import conftest as fix
 
 
 @pytest.fixture
@@ -32,20 +33,21 @@ def test_format_log(mock_time, status_code, environ, out):
 
 
 @pytest.mark.parametrize(
-    "app, log_level, exp_level",
+    "app, log_level, exp_level, exception",
     [
-        ("TEST", "INFO", 20),
-        ("FEST", "DEBUG", 10),
-        ("PEST", "CRITICAL", 50),
-        ("BEST", "WARNING", 30),
-        ("NEST", "NOTSET", 0),
-        ("REST", "this_isnt_a_log_level", 20),
+        ("TEST", "INFO", 20, fix.no_exc()),
+        ("FEST", "DEBUG", 10, fix.no_exc()),
+        ("PEST", "CRITICAL", 50, fix.no_exc()),
+        ("BEST", "WARNING", 30, fix.no_exc()),
+        ("NEST", "NOTSET", 0, fix.no_exc()),
+        ("REST", "this_isnt_a_log_level", 20, pytest.raises(ValueError)),
     ],
 )
-def test_init(app, log_level, exp_level):
-    lo = lw.ConnaisseurLoggingWrapper(app, log_level)
-    assert lo.logger.level == exp_level
-    assert lo.app == app
+def test_init(app, log_level, exp_level, exception):
+    with exception:
+        lo = lw.ConnaisseurLoggingWrapper(app, log_level)
+        assert lo.logger.level == exp_level
+        assert lo.app == app
 
 
 def test_call():
