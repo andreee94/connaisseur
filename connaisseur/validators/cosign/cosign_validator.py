@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import os
@@ -21,17 +22,24 @@ from connaisseur.validators.interface import ValidatorInterface
 class CosignValidator(ValidatorInterface):
     name: str
     trust_roots: list
+    vals: dict
 
     def __init__(self, name: str, trust_roots: list, **kwargs):
         super().__init__(name, **kwargs)
         self.trust_roots = trust_roots
+        self.vals = {}
 
     def __get_key(self, key_name: str = None):
         key_name = key_name or "default"
 
         if key_name == "*":
             keys = {
-                k["name"]: {"name": k["name"], "key": Key("".join(k["key"]))}
+                k["name"]: {
+                    "name": k["name"],
+                    "key": Key("".join(k["key"])),
+                    "digest": None,
+                    "error": None,
+                }
                 for k in self.trust_roots
             }
         else:
@@ -42,34 +50,43 @@ class CosignValidator(ValidatorInterface):
                 raise NotFoundException(
                     message=msg, key_name=key_name, validator_name=self.name
                 ) from err
-            keys = {key_name: {"name": key_name, "key": Key("".join(key))}}
+            keys = {
+                key_name: {
+                    "name": key_name,
+                    "key": Key("".join(key)),
+                    "digest": None,
+                    "error": None,
+                }
+            }
         return keys
 
     async def validate(
         self, image: Image, trust_root: str = None, **kwargs
     ):  # pylint: disable=arguments-differ
-        roots = self.__get_key(trust_root)
+        self.vals = self.__get_key(trust_root)
 
         threshold = kwargs.get(
             "threshold", len(self.trust_roots) if trust_root == "*" else 1
         )
         required = kwargs.get("required", [])
 
-        for name, root in roots.items():
-            try:
-                roots[name]["digests"] = self.__get_cosign_validated_digests(
-                    image, root
-                ).pop()
-            except Exception as err:
-                roots[name]["digests"] = None
-                roots[name]["error"] = err
-                logging.info(err)
+        tasks = [self.__execute_validations(k, image) for k in self.vals.keys()]
+        await asyncio.gather(*tasks)
 
         return CosignValidator.__apply_policy(
-            roots=roots, threshold=threshold, required=required
+            vals=self.vals, threshold=threshold, required=required
         )
 
-    def __get_cosign_validated_digests(self, image: Image, trust_root: dict):
+    async def __execute_validations(self, trust_root: str, image: str):
+        try:
+            self.vals[trust_root]["digest"] = await self.__get_cosign_validated_digests(
+                image, self.vals[trust_root]
+            )
+        except Exception as err:
+            self.vals[trust_root]["error"] = err
+            logging.info(err)
+
+    async def __get_cosign_validated_digests(self, image: Image, trust_root: dict):
         """
         Get and process Cosign validation output for a given `image` and `key`
         and either return a list of valid digests or raise a suitable exception
@@ -77,13 +94,13 @@ class CosignValidator(ValidatorInterface):
         """
         key = trust_root["key"]
 
-        returncode, stdout, stderr = key.verify(
+        returncode, stdout, stderr = await key.verify(
             validator_type="cosign", cosign_callback=self.__cosign_callback, image=image
         )
         logging.info(
             "COSIGN output of trust root '%s' for image'%s': RETURNCODE: %s; STDOUT: %s; STDERR: %s",
             trust_root["name"],
-            image,
+            str(image),
             returncode,
             stdout,
             stderr,
@@ -158,9 +175,9 @@ class CosignValidator(ValidatorInterface):
                 image=str(image),
                 trust_root=trust_root["name"],
             )
-        return digests
+        return digests.pop()
 
-    def __cosign_callback(self, image: Image, key_args: list):
+    async def __cosign_callback(self, image: Image, key_args: list):
         option_kword, inline_key, key = key_args
         cmd = [
             "/app/cosign/cosign",
@@ -201,7 +218,7 @@ class CosignValidator(ValidatorInterface):
         return env
 
     @staticmethod
-    def __apply_policy(roots: dict, threshold: int, required: list):
+    def __apply_policy(vals: dict, threshold: int, required: list):
         """
         TODO: applies the validation policy
 
@@ -209,19 +226,17 @@ class CosignValidator(ValidatorInterface):
         """
 
         # verify threshold
-        signed_digests = [
-            k["digests"] for i, k in roots.items() if k["digests"] is not None
-        ]
+        signed_digests = [k["digest"] for k in vals.values() if k["digest"] is not None]
         # check that same digest present 'threshold' times
         if not len(set(signed_digests)) == 1 or not len(signed_digests) >= threshold:
-            if len(roots) == 1:
-                raise list(roots.values()).pop()["error"]
+            if len(vals) == 1:
+                raise list(vals.values()).pop()["error"]
             else:
                 errs = "\n".join(
                     [
                         f"* trust root '{e['name']}': {e['error'].message}"
-                        for e in roots.values()
-                        if "error" in e.keys()
+                        for e in vals.values()
+                        if e["error"] is not None
                     ]
                 )
                 msg = "Image not compliant with validation policy (threshold of '{threshold}' not reached). The following errors occurred (please check the logs for more information):\n{errors}"
@@ -238,14 +253,14 @@ class CosignValidator(ValidatorInterface):
         # verify required trust roots
         missing_trust_roots = []
         for trust_root in required:
-            if not roots[trust_root]["digests"] == digest:
+            if not vals[trust_root]["digest"] == digest:
                 missing_trust_roots.append(trust_root)
 
         if missing_trust_roots:
             errs = "\n".join(
                 [
                     f"* trust root '{e['name']}': {e['error'].message}"
-                    for e in roots.values()
+                    for e in vals.values()
                     if e["name"] in missing_trust_roots
                 ]
             )
